@@ -1,0 +1,106 @@
+#include <Arduino.h>
+
+// Pines
+#define LED_PIN 2
+#define SENSOR_PIN 34
+
+int valorSensor = 0;
+bool estadoLED = false;
+
+
+// TAREA 1: Lectura del sensor
+void tareaSensor(void *parameter)
+{
+  while(true)
+  {
+    valorSensor = analogRead(SENSOR_PIN);
+
+    Serial.print("Sensor: ");
+    Serial.println(valorSensor);
+
+    vTaskDelay(500 / portTICK_PERIOD_MS);
+  }
+}
+
+
+// TAREA 2: Control del LED
+void tareaLED(void *parameter)
+{
+  while(true)
+  {
+    estadoLED = !estadoLED;
+
+    digitalWrite(LED_PIN, estadoLED);
+
+    Serial.println("LED cambiado");
+
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
+  }
+}
+
+
+// TAREA 3: Reporte del sistema
+void tareaSerial(void *parameter)
+{
+  while(true)
+  {
+    Serial.println("---- Estado del sistema ----");
+
+    Serial.print("Valor sensor: ");
+    Serial.println(valorSensor);
+
+    Serial.print("LED: ");
+    Serial.println(estadoLED);
+
+    Serial.println("----------------------------");
+
+    vTaskDelay(2000 / portTICK_PERIOD_MS);
+  }
+}
+
+
+void setup()
+{
+  Serial.begin(115200);
+
+  pinMode(LED_PIN, OUTPUT);
+
+
+  // Crear tareas FreeRTOS
+
+  xTaskCreate(
+    tareaSensor,
+    "Sensor",
+    2048,
+    NULL,
+    1,
+    NULL
+  );
+
+
+  xTaskCreate(
+    tareaLED,
+    "LED",
+    2048,
+    NULL,
+    2,
+    NULL
+  );
+
+
+  xTaskCreate(
+    tareaSerial,
+    "Serial",
+    2048,
+    NULL,
+    1,
+    NULL
+  );
+
+}
+
+
+void loop()
+{
+  // vacío porque FreeRTOS maneja las tareas
+}
