@@ -1,0 +1,111 @@
+#include <stdio.h>
+#include <string.h>
+#include <ctype.h>
+#include "driver/uart.h"
+#include "driver/gpio.h"
+#include "esp_log.h"
+
+#define UART_PORT_NUM      UART_NUM_2
+#define UART_TX_PIN        GPIO_NUM_17
+#define UART_RX_PIN        GPIO_NUM_16
+#define BUF_SIZE           1024
+#define BAUD_RATE          115200
+#define LED_GPIO           GPIO_NUM_2
+static const char *TAG = "UART2_APP";
+static uint32_t cmd_counter = 0;
+static bool light_status = false;
+
+void sanitize_input(char *input) {
+    int i = 0, j = 0;
+    while (input[i] != '\0') {
+        if (input[i] != '\r' && input[i] != '\n') {
+            input[j++] = input[i];
+        }
+        i++;
+    }
+    input[j] = '\0';
+
+    while (j > 0 && isspace((unsigned char)input[j - 1])) {
+        input[--j] = '\0';
+    }
+}
+
+void setup_uart2(void) {
+    // Configurar GPIO del LED
+    gpio_reset_pin(LED_GPIO);
+    gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_level(LED_GPIO, light_status);
+
+    const uart_config_t uart_config = {
+        .baud_rate = BAUD_RATE,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+
+    ESP_ERROR_CHECK(uart_param_config(UART_PORT_NUM, &uart_config));
+    ESP_ERROR_CHECK(uart_set_pin(UART_PORT_NUM, UART_TX_PIN, UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    ESP_ERROR_CHECK(uart_driver_install(UART_PORT_NUM, BUF_SIZE * 2, BUF_SIZE * 2, 0, NULL, 0));
+}
+
+// Intérprete y procesador de comandos
+void handle_command(char* command) {
+    sanitize_input(command);
+
+    if (strlen(command) == 0) return;
+
+    cmd_counter++;
+    char reply[256];
+
+    if (strcmp(command, "status") == 0) {
+        snprintf(reply, sizeof(reply), "\r\n[UART2] Estado del sistema: OK | LED: %s\r\n> ", light_status ? "ENCENDIDO" : "APAGADO");
+    } 
+    else if (strcmp(command, "led on") == 0) {
+        light_status = true;
+        gpio_set_level(LED_GPIO, 1);
+        snprintf(reply, sizeof(reply), "\r\n[UART2] Accion: LED Encendido\r\n> ");
+    } 
+    else if (strcmp(command, "led off") == 0) {
+        light_status = false;
+        gpio_set_level(LED_GPIO, 0);
+        snprintf(reply, sizeof(reply), "\r\n[UART2] Accion: LED Apagado \r\n> ");
+    } 
+    else if (strcmp(command, "info") == 0) {
+        snprintf(reply, sizeof(reply), "\r\n[UART2] Info: Puerto=UART2 | BaudRate=%d | Comandos Procesados=%lu\r\n> ", 
+                 BAUD_RATE, (unsigned long)cmd_counter);
+    } 
+    else if (strcmp(command, "reset") == 0) {
+        cmd_counter = 0;
+        snprintf(reply, sizeof(reply), "\r\n[UART2] Variables reiniciadas.\r\n> ");
+    } 
+    else {
+        snprintf(reply, sizeof(reply), "\r\n[UART2] Error: Comando desconocido '%s'\r\n> ", command);
+    }
+
+    // Enviar la respuesta directamente a través del driver UART2
+    uart_write_bytes(UART_PORT_NUM, reply, strlen(reply));
+}
+
+// Bucle principal
+void app_main(void) {
+    ESP_LOGI(TAG, "Iniciando Ejercicio 1...");
+    setup_uart2();
+
+    const char* header = "\r\nCOMANDOS UART2 (ESP-IDF) \r\n"
+                         "Comandos: status, led on, led off, info, reset\r\n> ";
+    uart_write_bytes(UART_PORT_NUM, header, strlen(header));
+
+    uint8_t input_buffer[BUF_SIZE];
+
+    while (1) {
+        // Lectura no bloqueante del buffer
+        int bytes_read = uart_read_bytes(UART_PORT_NUM, input_buffer, BUF_SIZE - 1, 5);
+        
+        if (bytes_read > 0) {
+            input_buffer[bytes_read] = '\0';
+            handle_command((char*)input_buffer);
+        }
+    }
+}
