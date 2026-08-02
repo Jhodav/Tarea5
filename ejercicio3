@@ -1,0 +1,392 @@
+#include <stdio.h>
+#include <string.h>
+#include <ctype.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "driver/uart.h"
+#include "driver/gpio.h"
+#include "driver/i2c.h"
+#include "esp_log.h"
+
+// ================= CONFIGURACIÓN =================
+#define CMD_UART_PORT      UART_NUM_0
+#define CMD_UART_TX        GPIO_NUM_1
+#define CMD_UART_RX        GPIO_NUM_3
+#define CMD_BAUD           115200
+
+#define RESP_UART_PORT     UART_NUM_2
+#define RESP_UART_TX       GPIO_NUM_17
+#define RESP_UART_RX       GPIO_NUM_16
+#define RESP_BAUD          115200
+
+#define BUF_SIZE           1024
+#define LED_GPIO           GPIO_NUM_2
+
+#define OLED_SDA GPIO_NUM_21
+#define OLED_SCL GPIO_NUM_22
+#define OLED_ADDR 0x3C
+#define I2C_MASTER_PORT I2C_NUM_0
+
+// ================= VARIABLES GLOBALES =================
+QueueHandle_t uart_queue;
+uint32_t cmd_counter = 0;
+bool light_status = false;
+char system_status[50] = "System OK";
+
+uint8_t oled_buffer[1024];
+
+// ================= FUNCIONES OLED =================
+
+void oled_write_cmd(uint8_t cmd) {
+    i2c_cmd_handle_t cmd_handle = i2c_cmd_link_create();
+    i2c_master_start(cmd_handle);
+    i2c_master_write_byte(cmd_handle, (OLED_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd_handle, 0x00, true);
+    i2c_master_write_byte(cmd_handle, cmd, true);
+    i2c_master_stop(cmd_handle);
+    i2c_master_cmd_begin(I2C_MASTER_PORT, cmd_handle, 1000 / portTICK_PERIOD_MS);
+    i2c_cmd_link_delete(cmd_handle);
+}
+
+void oled_write_data(uint8_t *data, size_t len) {
+    i2c_cmd_handle_t cmd_handle = i2c_cmd_link_create();
+    i2c_master_start(cmd_handle);
+    i2c_master_write_byte(cmd_handle, (OLED_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd_handle, 0x40, true);
+    i2c_master_write(cmd_handle, data, len, true);
+    i2c_master_stop(cmd_handle);
+    i2c_master_cmd_begin(I2C_MASTER_PORT, cmd_handle, 1000 / portTICK_PERIOD_MS);
+    i2c_cmd_link_delete(cmd_handle);
+}
+
+void oled_init() {
+    oled_write_cmd(0xAE);
+    oled_write_cmd(0xD5); oled_write_cmd(0x80);
+    oled_write_cmd(0xA8); oled_write_cmd(0x3F);
+    oled_write_cmd(0xD3); oled_write_cmd(0x00);
+    oled_write_cmd(0x40);
+    oled_write_cmd(0x8D); oled_write_cmd(0x14);
+    oled_write_cmd(0x20); oled_write_cmd(0x00);
+    oled_write_cmd(0xA1); oled_write_cmd(0xC8);
+    oled_write_cmd(0xDA); oled_write_cmd(0x12);
+    oled_write_cmd(0x81); oled_write_cmd(0xCF);
+    oled_write_cmd(0xD9); oled_write_cmd(0xF1);
+    oled_write_cmd(0xDB); oled_write_cmd(0x40);
+    oled_write_cmd(0xA4); oled_write_cmd(0xA6);
+    oled_write_cmd(0xAF);
+    memset(oled_buffer, 0, 1024);
+}
+
+void oled_clear() {
+    memset(oled_buffer, 0, 1024);
+}
+
+void oled_draw_pixel(int x, int y) {
+    if (x < 0 || x >= 128 || y < 0 || y >= 64) return;
+    int page = y / 8;
+    int bit = y % 8;
+    oled_buffer[page * 128 + x] |= (1 << bit);
+}
+
+void oled_draw_hline(int x0, int x1, int y) {
+    for (int x = x0; x <= x1; x++) {
+        oled_draw_pixel(x, y);
+    }
+}
+
+void oled_draw_vline_dashed(int x, int y0, int y1) {
+    for (int y = y0; y <= y1; y++) {
+        if ((y % 3) == 0) {
+            oled_draw_pixel(x, y);
+        }
+    }
+}
+
+void oled_draw_char(int x, int y, char c) {
+    const uint8_t font[][6] = {
+        {'0', 0x3E, 0x41, 0x41, 0x41, 0x3E},
+        {'1', 0x00, 0x42, 0x7F, 0x40, 0x00},
+        {'2', 0x42, 0x61, 0x51, 0x49, 0x46},
+        {'3', 0x22, 0x41, 0x49, 0x49, 0x36},
+        {'4', 0x18, 0x14, 0x12, 0x7F, 0x10},
+        {'5', 0x27, 0x45, 0x45, 0x45, 0x39},
+        {'6', 0x3C, 0x4A, 0x49, 0x49, 0x30},
+        {'7', 0x01, 0x71, 0x09, 0x05, 0x03},
+        {'8', 0x36, 0x49, 0x49, 0x49, 0x36},
+        {'9', 0x06, 0x49, 0x49, 0x29, 0x1E},
+        {'A', 0x7C, 0x12, 0x11, 0x12, 0x7C},
+        {'C', 0x3E, 0x41, 0x41, 0x41, 0x22},
+        {'E', 0x7F, 0x49, 0x49, 0x49, 0x41},
+        {'L', 0x7F, 0x40, 0x40, 0x40, 0x40},
+        {'T', 0x01, 0x01, 0x7F, 0x01, 0x01},
+        {'S', 0x46, 0x49, 0x49, 0x49, 0x31},
+        {'K', 0x7F, 0x08, 0x14, 0x22, 0x41},
+        {' ', 0x00, 0x00, 0x00, 0x00, 0x00}
+    };
+    
+    int font_size = sizeof(font) / sizeof(font[0]);
+    
+    for (int i = 0; i < font_size; i++) {
+        if (font[i][0] == c) {
+            for (int col = 0; col < 5; col++) {
+                uint8_t colbits = font[i][col + 1];
+                for (int row = 0; row < 7; row++) {
+                    if ((colbits >> row) & 0x01) {
+                        oled_draw_pixel(x + col, y + row);
+                    }
+                }
+            }
+            return;
+        }
+    }
+}
+
+void oled_draw_string(int x, int y, const char *s) {
+    int cx = x;
+    while (*s) {
+        oled_draw_char(cx, y, *s);
+        cx += 6;
+        s++;
+    }
+}
+
+void oled_update() {
+    i2c_cmd_handle_t cmd_handle = i2c_cmd_link_create();
+    i2c_master_start(cmd_handle);
+    i2c_master_write_byte(cmd_handle, (OLED_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd_handle, 0x40, true);
+    i2c_master_write(cmd_handle, oled_buffer, 1024, true);
+    i2c_master_stop(cmd_handle);
+    i2c_master_cmd_begin(I2C_MASTER_PORT, cmd_handle, 1000 / portTICK_PERIOD_MS);
+    i2c_cmd_link_delete(cmd_handle);
+}
+
+void i2c_init() {
+    i2c_config_t conf = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = OLED_SDA,
+        .scl_io_num = OLED_SCL,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = 100000,
+    };
+    i2c_param_config(I2C_MASTER_PORT, &conf);
+    i2c_driver_install(I2C_MASTER_PORT, I2C_MODE_MASTER, 0, 0, 0);
+}
+
+// ================= FUNCIONES UART =================
+
+void sanitize_input(char *input) {
+    int i = 0, j = 0;
+    while (input[i]) {
+        if (input[i] != '\r' && input[i] != '\n') input[j++] = input[i];
+        i++;
+    }
+    input[j] = '\0';
+    while (j > 0 && isspace((unsigned char)input[j - 1])) input[--j] = '\0';
+}
+
+void setup_uart0() {
+    gpio_reset_pin(LED_GPIO);
+    gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_level(LED_GPIO, 0);
+
+    const uart_config_t uart_config = {
+        .baud_rate = CMD_BAUD,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+    uart_param_config(CMD_UART_PORT, &uart_config);
+    uart_set_pin(CMD_UART_PORT, CMD_UART_TX, CMD_UART_RX, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    uart_driver_install(CMD_UART_PORT, BUF_SIZE * 2, BUF_SIZE * 2, 20, &uart_queue, 0);
+}
+
+void setup_uart2() {
+    const uart_config_t uart_config = {
+        .baud_rate = RESP_BAUD,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+    uart_param_config(RESP_UART_PORT, &uart_config);
+    uart_set_pin(RESP_UART_PORT, RESP_UART_TX, RESP_UART_RX, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    uart_driver_install(RESP_UART_PORT, BUF_SIZE * 2, BUF_SIZE * 2, 0, NULL, 0);
+}
+
+// ================= TAREAS FREERTOS =================
+
+void task_command_processor(void *pvParameters) {
+    uart_event_t event;
+    uint8_t data[BUF_SIZE];
+    char reply[256];
+
+    const char* header = "\n============================\n"
+                         "COMANDOS:\n"
+                         "- led on\n- led off\n- status\n- info\n- reset\n"
+                         "============================\n> ";
+    uart_write_bytes(CMD_UART_PORT, header, strlen(header));
+
+    while (1) {
+        if (xQueueReceive(uart_queue, &event, portMAX_DELAY)) {
+            if (event.type == UART_DATA) {
+                int len = uart_read_bytes(CMD_UART_PORT, data, event.size, 100 / portTICK_PERIOD_MS);
+                if (len > 0) {
+                    data[len] = '\0';
+                    sanitize_input((char*)data);
+
+                    if (strlen((char*)data) == 0) {
+                        uart_write_bytes(CMD_UART_PORT, "> ", 2);
+                        continue;
+                    }
+
+                    cmd_counter++;
+                    printf("Comando: %s\n", data);
+
+                    if (strcmp((char*)data, "status") == 0) {
+                        snprintf(reply, sizeof(reply), "[RESP] Estado: %s | LED: %s\n> ", system_status, light_status ? "ON" : "OFF");
+                    }
+                    else if (strcmp((char*)data, "led on") == 0) {
+                        light_status = true;
+                        gpio_set_level(LED_GPIO, 1);
+                        strcpy(system_status, "LED ON");
+                        snprintf(reply, sizeof(reply), "[RESP] LED Encendido.\n> ");
+                    }
+                    else if (strcmp((char*)data, "led off") == 0) {
+                        light_status = false;
+                        gpio_set_level(LED_GPIO, 0);
+                        strcpy(system_status, "LED OFF");
+                        snprintf(reply, sizeof(reply), "[RESP] LED Apagado.\n> ");
+                    }
+                    else if (strcmp((char*)data, "info") == 0) {
+                        snprintf(reply, sizeof(reply), "[RESP] Cmd: %lu | Baud: %d\n> ", (unsigned long)cmd_counter, CMD_BAUD);
+                    }
+                    else if (strcmp((char*)data, "reset") == 0) {
+                        cmd_counter = 0;
+                        snprintf(reply, sizeof(reply), "[RESP] Contador reiniciado.\n> ");
+                    }
+                    else {
+                        snprintf(reply, sizeof(reply), "[ERROR] Comando no reconocido.\n> ");
+                    }
+                    uart_write_bytes(CMD_UART_PORT, reply, strlen(reply));
+                }
+            }
+        }
+    }
+}
+
+void task_led_blink(void *pvParameters) {
+    while (1) {
+        if (light_status) {
+            gpio_set_level(LED_GPIO, 1);
+        } else {
+            gpio_set_level(LED_GPIO, 0);
+        }
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+    }
+}
+
+// Tarea 3: Gráfico de BARRAS (exacto a la foto)
+void task_oled_graphic(void *pvParameters) {
+    int time_slot = 40;
+    static uint32_t last_counter = 0;
+    int auto_trigger = 0;
+
+    // Variables para llevar el historial de actividad
+    bool task1_history[128] = {0};
+    bool task2_history[128] = {0};
+    bool task3_history[128] = {0};
+
+    // Dibujar el fondo UNA SOLA VEZ
+    oled_clear();
+    oled_draw_string(0, 0, "TASK 1");
+    oled_draw_string(0, 15, "TASK 2");
+    oled_draw_string(0, 30, "TASK 3");
+    oled_draw_string(50, 55, "T1");
+    oled_draw_string(80, 55, "T2");
+    oled_draw_hline(40, 120, 50);
+    oled_update();
+
+    while (1) {
+        // Determinar actividad actual
+        bool task1_active = false;
+        bool task2_active = false;
+        bool task3_active = false;
+
+        if (cmd_counter != last_counter) {
+            task1_active = true;
+            last_counter = cmd_counter;
+        }
+        task2_active = light_status;
+        auto_trigger++;
+        if (auto_trigger > 15) {
+            task3_active = true;
+            auto_trigger = 0;
+        }
+
+        // Guardar en el historial
+        task1_history[time_slot] = task1_active;
+        task2_history[time_slot] = task2_active;
+        task3_history[time_slot] = task3_active;
+
+        // Limpiar la columna anterior para no acumular
+        int prev_slot = time_slot - 1;
+        if (prev_slot < 40) prev_slot = 119;
+        task1_history[prev_slot] = false;
+        task2_history[prev_slot] = false;
+        task3_history[prev_slot] = false;
+
+        // Redibujar todas las barras históricas (ventana deslizante)
+        // Solo mostramos las barras donde el historial es true
+        for (int x = 40; x < 120; x++) {
+            if (task1_history[x]) {
+                oled_draw_hline(x - 2, x + 1, 6);
+            }
+            if (task2_history[x]) {
+                oled_draw_hline(x - 2, x + 1, 21);
+            }
+            if (task3_history[x]) {
+                oled_draw_hline(x - 2, x + 1, 36);
+            }
+        }
+
+        // Dibujar líneas verticales punteadas en T1 y T2
+        oled_draw_vline_dashed(70, 48, 53);
+        oled_draw_vline_dashed(90, 48, 53);
+
+        // Actualizar pantalla
+        oled_update();
+
+        // Avanzar el puntero
+        time_slot++;
+        if (time_slot >= 120) time_slot = 40;
+
+        vTaskDelay(150 / portTICK_PERIOD_MS);
+    }
+}
+
+// ================= MAIN =================
+void app_main(void) {
+    printf("\n=== SISTEMA INICIADO ===\n");
+    printf("Escribe comandos (led on, led off, etc.)\n");
+
+    gpio_reset_pin(LED_GPIO);
+    gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
+
+    setup_uart0();
+    setup_uart2();
+
+    i2c_init();
+    oled_init();
+
+    xTaskCreate(task_command_processor, "Cmd_Process", 4096, NULL, 3, NULL);
+    xTaskCreate(task_led_blink, "LED_Control", 2048, NULL, 2, NULL);
+    xTaskCreate(task_oled_graphic, "OLED_Graphic", 4096, NULL, 1, NULL);
+
+    printf("Sistema ejecutandose...\n");
+}
